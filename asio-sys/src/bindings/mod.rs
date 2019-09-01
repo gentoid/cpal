@@ -85,7 +85,7 @@ pub struct SampleRate {
 }
 
 /// Holds the pointer to the callbacks that come from cpal
-struct BufferCallback(Box<FnMut(i32) + Send>);
+struct BufferCallback(Box<dyn FnMut(i32) + Send>);
 
 /// Input and Output streams.
 ///
@@ -863,7 +863,7 @@ extern "C" fn buffer_switch_time_info(
 ) -> *mut ai::ASIOTime {
     // This lock is probably unavoidable, but locks in the audio stream are not great.
     let mut bcs = BUFFER_CALLBACK.lock().unwrap();
-    for mut bc in bcs.iter_mut() {
+    for bc in bcs.iter_mut() {
         if let Some(ref mut bc) = bc {
             bc.run(double_buffer_index);
         }
