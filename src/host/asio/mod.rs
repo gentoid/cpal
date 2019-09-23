@@ -1,25 +1,35 @@
 extern crate asio_sys as sys;
 
-use {
+use crate::{
     BuildStreamError,
     DefaultFormatError,
     DeviceNameError,
     DevicesError,
     Format,
-    PauseStreamError,
-    PlayStreamError,
-    StreamDataResult,
+    // PauseStreamError,
+    // PlayStreamError,
     SupportedFormatsError,
+    StreamData,
+    StreamError,
 };
 use traits::{
     DeviceTrait,
-    EventLoopTrait,
     HostTrait,
-    StreamIdTrait,
 };
 
+// use self::stream::{
+//     build_stream_err,
+//     InterleavedSample,
+//     AsioSample,
+//     cast_slice_mut,
+//     asio_channel_slice,
+//     StreamInner,
+// };
+
+// use std::sync::atomic::Ordering;
+
 pub use self::device::{Device, Devices, SupportedInputFormats, SupportedOutputFormats};
-pub use self::stream::{EventLoop, StreamId};
+pub use self::stream::{Stream};
 use std::sync::Arc;
 
 mod device;
@@ -42,7 +52,6 @@ impl Host {
 impl HostTrait for Host {
     type Devices = Devices;
     type Device = Device;
-    type EventLoop = EventLoop;
 
     fn is_available() -> bool {
         true
@@ -62,15 +71,12 @@ impl HostTrait for Host {
         // ASIO has no concept of a default device, so just use the first.
         self.output_devices().ok().and_then(|mut ds| ds.next())
     }
-
-    fn event_loop(&self) -> Self::EventLoop {
-        EventLoop::new()
-    }
 }
 
 impl DeviceTrait for Device {
     type SupportedInputFormats = SupportedInputFormats;
     type SupportedOutputFormats = SupportedOutputFormats;
+    type Stream = Stream;
 
     fn name(&self) -> Result<String, DeviceNameError> {
         Device::name(self)
@@ -91,46 +97,21 @@ impl DeviceTrait for Device {
     fn default_output_format(&self) -> Result<Format, DefaultFormatError> {
         Device::default_output_format(self)
     }
-}
 
-impl EventLoopTrait for EventLoop {
-    type Device = Device;
-    type StreamId = StreamId;
+    // TODO: implement
+    fn build_input_stream<D, E>(&self, format: &Format, data_callback: D, error_callback: E)
+    -> Result<Self::Stream, BuildStreamError>
+    where D: FnMut(StreamData) + Send + 'static, E: FnMut(StreamError) + Send + 'static {
+        Ok(Stream::new(
+            self.build_input_stream_inner(format, data_callback, error_callback)?,
+        ))}
 
-    fn build_input_stream(
-        &self,
-        device: &Self::Device,
-        format: &Format,
-    ) -> Result<Self::StreamId, BuildStreamError> {
-        EventLoop::build_input_stream(self, device, format)
-    }
-
-    fn build_output_stream(
-        &self,
-        device: &Self::Device,
-        format: &Format,
-    ) -> Result<Self::StreamId, BuildStreamError> {
-        EventLoop::build_output_stream(self, device, format)
-    }
-
-    fn play_stream(&self, stream: Self::StreamId) -> Result<(), PlayStreamError> {
-        EventLoop::play_stream(self, stream)
-    }
-
-    fn pause_stream(&self, stream: Self::StreamId) -> Result<(), PauseStreamError> {
-        EventLoop::pause_stream(self, stream)
-    }
-
-    fn destroy_stream(&self, stream: Self::StreamId) {
-        EventLoop::destroy_stream(self, stream)
-    }
-
-    fn run<F>(&self, callback: F) -> !
-    where
-        F: FnMut(Self::StreamId, StreamDataResult) + Send,
-    {
-        EventLoop::run(self, callback)
+    // TODO: implement
+    fn build_output_stream<D, E>(&self, format: &Format, data_callback: D, error_callback: E) 
+    -> Result<Self::Stream, BuildStreamError>
+    where D: FnMut(StreamData) + Send + 'static, E: FnMut(StreamError) + Send + 'static {
+        Ok(Stream::new(
+            self.build_output_stream_inner(format, data_callback, error_callback)?,
+        ))
     }
 }
-
-impl StreamIdTrait for StreamId {}

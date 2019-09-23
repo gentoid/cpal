@@ -4,11 +4,8 @@ extern crate num_traits;
 use self::num_traits::PrimInt;
 use super::Device;
 use std;
-use std::mem;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::Duration;
+use std::sync::{Arc, Mutex, mpsc::{channel, Receiver, Sender}};
+use std::thread::{self, JoinHandle};
 use BackendSpecificError;
 use BuildStreamError;
 use Format;
@@ -16,9 +13,10 @@ use PauseStreamError;
 use PlayStreamError;
 use SampleFormat;
 use StreamData;
-use StreamDataResult;
 use UnknownTypeInputBuffer;
 use UnknownTypeOutputBuffer;
+
+use crate::{traits::StreamTrait, StreamError};
 
 /// Sample types whose constant silent value is known.
 trait Silence {
@@ -26,41 +24,53 @@ trait Silence {
 }
 
 /// Constraints on the interleaved sample buffer format required by the CPAL API.
-trait InterleavedSample: Clone + Copy + Silence {
+pub trait InterleavedSample: Clone + Copy + Silence {
     fn unknown_type_input_buffer(&[Self]) -> UnknownTypeInputBuffer;
     fn unknown_type_output_buffer(&mut [Self]) -> UnknownTypeOutputBuffer;
 }
 
 /// Constraints on the ASIO sample types.
-trait AsioSample: Clone + Copy + Silence + std::ops::Add<Self, Output = Self> {}
+pub trait AsioSample: Clone + Copy + Silence + std::ops::Add<Self, Output = Self> {}
 
 /// Controls all streams
-pub struct EventLoop {
-    /// The input and output ASIO streams
-    asio_streams: Arc<Mutex<sys::AsioStreams>>,
+pub struct Stream {
+    // /// The input and output ASIO streams
+    // asio_streams: Arc<Mutex<sys::AsioStreams>>,
     /// List of all CPAL streams
-    cpal_streams: Arc<Mutex<Vec<Option<Stream>>>>,
-    /// Total stream count.
-    stream_count: AtomicUsize,
-    /// The CPAL callback that the user gives to fill the buffers.
-    callbacks: Arc<Mutex<Option<&'static mut (FnMut(StreamId, StreamDataResult) + Send)>>>,
+    inner: StreamInner,
+    //  The CPAL callback that the user gives to fill the buffers.
+    // callbacks: Arc<Mutex<Option<&'static mut (dyn FnMut(StreamData) + Send)>>>,
+    //  The high-priority audio processing thread calling callbacks.
+    //  Option used for moving out in destructor.
+    // thread: Option<JoinHandle<()>>,
 }
-
-/// Id for each stream.
-/// Created depending on the number they are created.
-/// Starting at one! not zero.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct StreamId(usize);
 
 /// CPAL stream.
 /// This decouples the many cpal streams
 /// from the single input and single output
 /// ASIO streams.
 /// Each stream can be playing or paused.
-struct Stream {
+impl Stream {
+    pub fn new(inner: StreamInner) -> Self {
+        Self {
+            inner,
+            // thread,
+            // cpal_streams: Arc::new(Mutex::new(Vec::new())),
+            // // This is why the Id's count from one not zero
+            // // because at this point there is no streams
+            // stream_count: AtomicUsize::new(0),
+            // callbacks: Arc::new(Mutex::new(None)),
+        }
+    }
+}
+
+pub struct StreamInner {
     playing: bool,
     // The driver associated with this stream.
     driver: Arc<sys::Driver>,
+
+    /// The input and output ASIO streams
+    asio_streams: Arc<Mutex<sys::AsioStreams>>,
 }
 
 // Used to keep track of whether or not the current current asio stream buffer requires
@@ -71,20 +81,7 @@ struct SilenceAsioBuffer {
     second: bool,
 }
 
-impl EventLoop {
-    pub fn new() -> EventLoop {
-        EventLoop {
-            asio_streams: Arc::new(Mutex::new(sys::AsioStreams {
-                input: None,
-                output: None,
-            })),
-            cpal_streams: Arc::new(Mutex::new(Vec::new())),
-            // This is why the Id's count from one not zero
-            // because at this point there is no streams
-            stream_count: AtomicUsize::new(0),
-            callbacks: Arc::new(Mutex::new(None)),
-        }
-    }
+impl Device {
 
     /// Create a new CPAL Input Stream.
     ///
@@ -93,26 +90,25 @@ impl EventLoop {
     /// On success, the buffer size of the stream is returned.
     fn get_or_create_input_stream(
         &self,
-        driver: &sys::Driver,
+        inner: &StreamInner,
         format: &Format,
-        device: &Device,
     ) -> Result<usize, BuildStreamError> {
-        match device.default_input_format() {
+        match self.default_input_format() {
             Ok(f) => {
                 let num_asio_channels = f.channels;
-                check_format(driver, format, num_asio_channels)
+                check_format(&inner.driver, format, num_asio_channels)
             },
             Err(_) => Err(BuildStreamError::FormatNotSupported),
         }?;
         let num_channels = format.channels as usize;
-        let ref mut streams = *self.asio_streams.lock().unwrap();
+        let ref mut streams = *inner.asio_streams.lock().unwrap();
         // Either create a stream if thers none or had back the
         // size of the current one.
         match streams.input {
             Some(ref input) => Ok(input.buffer_size as usize),
             None => {
                 let output = streams.output.take();
-                driver
+                inner.driver
                     .prepare_input_stream(output, num_channels)
                     .map(|new_streams| {
                         let bs = match new_streams.input {
@@ -136,25 +132,24 @@ impl EventLoop {
     /// On success, the buffer size of the stream is returned.
     fn get_or_create_output_stream(
         &self,
-        driver: &sys::Driver,
+        inner: &StreamInner,
         format: &Format,
-        device: &Device,
     ) -> Result<usize, BuildStreamError> {
-        match device.default_output_format() {
+        match self.default_output_format() {
             Ok(f) => {
                 let num_asio_channels = f.channels;
-                check_format(driver, format, num_asio_channels)
+                check_format(&inner.driver, format, num_asio_channels)
             },
             Err(_) => Err(BuildStreamError::FormatNotSupported),
         }?;
         let num_channels = format.channels as usize;
-        let ref mut streams = *self.asio_streams.lock().unwrap();
+        let ref mut streams = *inner.asio_streams.lock().unwrap();
         // Either create a stream if there's none or return the size of the current one.
         match streams.output {
             Some(ref output) => Ok(output.buffer_size as usize),
             None => {
                 let input = streams.input.take();
-                driver
+                inner.driver
                     .prepare_output_stream(input, num_channels)
                     .map(|new_streams| {
                         let bs = match new_streams.output {
@@ -172,12 +167,16 @@ impl EventLoop {
     }
 
     /// Builds a new cpal input stream
-    pub fn build_input_stream(
+    pub fn build_input_stream_inner<D, E>(
         &self,
-        device: &Device,
         format: &Format,
-    ) -> Result<StreamId, BuildStreamError> {
-        let Device { driver, .. } = device;
+        data_callback: D,
+        error_callback: E,
+    )
+    -> Result<StreamInner, BuildStreamError> 
+    where D: FnMut(StreamData) + Send + 'static, E: FnMut(StreamError) + Send + 'static
+    {
+        let Self { driver, .. } = self;
         let stream_type = driver.input_data_type().map_err(build_stream_err)?;
 
         // Ensure that the desired sample type is supported.
@@ -187,16 +186,21 @@ impl EventLoop {
             return Err(BuildStreamError::FormatNotSupported);
         }
 
+        let stream_inner = StreamInner {
+            playing: false,
+            driver: driver.clone(),
+            asio_streams: Arc::new(Mutex::new(sys::AsioStreams {
+                input: None,
+                output: None,
+            })),
+        };
+
         let num_channels = format.channels.clone();
-        let stream_buffer_size = self.get_or_create_input_stream(&driver, format, device)?;
+        let stream_buffer_size = self.get_or_create_input_stream(&stream_inner, format)?;
         let cpal_num_samples = stream_buffer_size * num_channels as usize;
-        let count = self.stream_count.fetch_add(1, Ordering::SeqCst);
-        let asio_streams = self.asio_streams.clone();
-        let cpal_streams = self.cpal_streams.clone();
-        let callbacks = self.callbacks.clone();
 
         // Create the buffer depending on the size of the data type.
-        let stream_id = StreamId(count);
+        // let stream_id = StreamId(count);
         let len_bytes = cpal_num_samples * data_type.sample_size();
         let mut interleaved = vec![0u8; len_bytes];
 
@@ -204,32 +208,21 @@ impl EventLoop {
         // This is most performance critical part of the ASIO bindings.
         driver.set_callback(move |buffer_index| unsafe {
             // If not playing return early.
-            // TODO: Don't assume `count` is valid - we should search for the matching `StreamId`.
-            if let Some(s) = cpal_streams.lock().unwrap().get(count) {
-                if let Some(s) = s {
-                    if !s.playing {
-                        return;
-                    }
-                }
-            }
+            // TODO: do we need to do here anything?
 
+            let asio_streams = stream_inner.asio_streams.clone();
             // Acquire the stream and callback.
             let stream_lock = asio_streams.lock().unwrap();
             let ref asio_stream = match stream_lock.input {
                 Some(ref asio_stream) => asio_stream,
                 None => return,
             };
-            let mut callbacks = callbacks.lock().unwrap();
-            let callback = match callbacks.as_mut() {
-                Some(callback) => callback,
-                None => return,
-            };
+            // let callback = data_callback;
 
             /// 1. Write from the ASIO buffer to the interleaved CPAL buffer.
             /// 2. Deliver the CPAL buffer to the user callback.
             unsafe fn process_input_callback<A, B, F, G>(
-                stream_id: StreamId,
-                callback: &mut (dyn FnMut(StreamId, StreamDataResult) + Send),
+                callback: &mut (dyn FnMut(StreamData) + Send),
                 interleaved: &mut [u8],
                 asio_stream: &sys::AsioStream,
                 buffer_index: usize,
@@ -254,16 +247,14 @@ impl EventLoop {
 
                 // 2. Deliver the interleaved buffer to the callback.
                 callback(
-                    stream_id,
-                    Ok(StreamData::Input { buffer: B::unknown_type_input_buffer(interleaved) }),
+                    StreamData::Input { buffer: B::unknown_type_input_buffer(interleaved) },
                 );
             }
 
             match (&stream_type, data_type) {
                 (&sys::AsioSampleType::ASIOSTInt16LSB, SampleFormat::I16) => {
                     process_input_callback::<i16, i16, _, _>(
-                        stream_id,
-                        callback,
+                        data_callback,
                         &mut interleaved,
                         asio_stream,
                         buffer_index as usize,
@@ -273,8 +264,7 @@ impl EventLoop {
                 }
                 (&sys::AsioSampleType::ASIOSTInt16MSB, SampleFormat::I16) => {
                     process_input_callback::<i16, i16, _, _>(
-                        stream_id,
-                        callback,
+                        data_callback,
                         &mut interleaved,
                         asio_stream,
                         buffer_index as usize,
@@ -288,8 +278,7 @@ impl EventLoop {
                 (&sys::AsioSampleType::ASIOSTFloat32LSB, SampleFormat::F32) |
                 (&sys::AsioSampleType::ASIOSTFloat32MSB, SampleFormat::F32) => {
                     process_input_callback::<f32, f32, _, _>(
-                        stream_id,
-                        callback,
+                        data_callback,
                         &mut interleaved,
                         asio_stream,
                         buffer_index as usize,
@@ -303,8 +292,7 @@ impl EventLoop {
                 // conversion function.
                 (&sys::AsioSampleType::ASIOSTInt32LSB, SampleFormat::I16) => {
                     process_input_callback::<i32, i16, _, _>(
-                        stream_id,
-                        callback,
+                        data_callback,
                         &mut interleaved,
                         asio_stream,
                         buffer_index as usize,
@@ -314,8 +302,7 @@ impl EventLoop {
                 }
                 (&sys::AsioSampleType::ASIOSTInt32MSB, SampleFormat::I16) => {
                     process_input_callback::<i32, i16, _, _>(
-                        stream_id,
-                        callback,
+                        data_callback,
                         &mut interleaved,
                         asio_stream,
                         buffer_index as usize,
@@ -328,8 +315,7 @@ impl EventLoop {
                 (&sys::AsioSampleType::ASIOSTFloat64LSB, SampleFormat::F32) |
                 (&sys::AsioSampleType::ASIOSTFloat64MSB, SampleFormat::F32) => {
                     process_input_callback::<f64, f32, _, _>(
-                        stream_id,
-                        callback,
+                        data_callback,
                         &mut interleaved,
                         asio_stream,
                         buffer_index as usize,
@@ -345,22 +331,18 @@ impl EventLoop {
             }
         });
 
-        // Create stream and set to paused
-        self.cpal_streams
-            .lock()
-            .unwrap()
-            .push(Some(Stream { driver: driver.clone(), playing: false }));
-
-        Ok(StreamId(count))
+        Ok(stream_inner)
     }
 
     /// Create the an output cpal stream.
-    pub fn build_output_stream(
+    pub fn build_output_stream_inner<D, E>(
         &self,
-        device: &Device,
         format: &Format,
-    ) -> Result<StreamId, BuildStreamError> {
-        let Device { driver, .. } = device;
+        data_callback: D,
+        error_callback: E,
+    ) -> Result<StreamInner, BuildStreamError> 
+    where D: FnMut(StreamData) + Send + 'static, E: FnMut(StreamError) + Send + 'static {
+        let Self { driver, .. } = self;
         let stream_type = driver.output_data_type().map_err(build_stream_err)?;
 
         // Ensure that the desired sample type is supported.
@@ -370,30 +352,27 @@ impl EventLoop {
             return Err(BuildStreamError::FormatNotSupported);
         }
 
+        let stream_inner = StreamInner {
+            playing: false,
+            driver: driver.clone(),
+            asio_streams: Arc::new(Mutex::new(sys::AsioStreams {
+                input: None,
+                output: None,
+            })),
+        };
+
         let num_channels = format.channels.clone();
-        let stream_buffer_size = self.get_or_create_output_stream(&driver, format, device)?;
+        let stream_buffer_size = self.get_or_create_output_stream(&stream_inner, format)?;
         let cpal_num_samples = stream_buffer_size * num_channels as usize;
-        let count = self.stream_count.fetch_add(1, Ordering::SeqCst);
-        let asio_streams = self.asio_streams.clone();
-        let cpal_streams = self.cpal_streams.clone();
-        let callbacks = self.callbacks.clone();
+        let asio_streams = stream_inner.asio_streams.clone();
 
         // Create buffers depending on data type.
-        let stream_id = StreamId(count);
         let len_bytes = cpal_num_samples * data_type.sample_size();
         let mut interleaved = vec![0u8; len_bytes];
         let mut silence_asio_buffer = SilenceAsioBuffer::default();
 
         driver.set_callback(move |buffer_index| unsafe {
             // If not playing, return early.
-            // TODO: Don't assume `count` is valid - we should search for the matching `StreamId`.
-            if let Some(s) = cpal_streams.lock().unwrap().get(count) {
-                if let Some(s) = s {
-                    if !s.playing {
-                        return ();
-                    }
-                }
-            }
 
             // Acquire the stream and callback.
             let stream_lock = asio_streams.lock().unwrap();
@@ -401,8 +380,7 @@ impl EventLoop {
                 Some(ref asio_stream) => asio_stream,
                 None => return,
             };
-            let mut callbacks = callbacks.lock().unwrap();
-            let callback = callbacks.as_mut();
+            let callback = data_callback;
 
             // Silence the ASIO buffer that is about to be used.
             //
@@ -431,8 +409,7 @@ impl EventLoop {
             /// 3. Finally, write the interleaved data to the non-interleaved ASIO buffer,
             ///    performing endianness conversions as necessary.
             unsafe fn process_output_callback<A, B, F, G>(
-                stream_id: StreamId,
-                callback: Option<&mut &mut (dyn FnMut(StreamId, StreamDataResult) + Send)>,
+                callback: Option<&mut (dyn FnMut(StreamData) + Send)>,
                 interleaved: &mut [u8],
                 silence_asio_buffer: bool,
                 asio_stream: &sys::AsioStream,
@@ -452,7 +429,7 @@ impl EventLoop {
                     None => interleaved.iter_mut().for_each(|s| *s = A::SILENCE),
                     Some(callback) => {
                         let buffer = A::unknown_type_output_buffer(interleaved);
-                        callback(stream_id, Ok(StreamData::Output { buffer }));
+                        callback(StreamData::Output { buffer });
                     }
                 }
 
@@ -479,8 +456,7 @@ impl EventLoop {
             match (data_type, &stream_type) {
                 (SampleFormat::I16, &sys::AsioSampleType::ASIOSTInt16LSB) => {
                     process_output_callback::<i16, i16, _, _>(
-                        stream_id,
-                        callback,
+                        Some(&mut callback),
                         &mut interleaved,
                         silence,
                         asio_stream,
@@ -491,8 +467,7 @@ impl EventLoop {
                 }
                 (SampleFormat::I16, &sys::AsioSampleType::ASIOSTInt16MSB) => {
                     process_output_callback::<i16, i16, _, _>(
-                        stream_id,
-                        callback,
+                        Some(&mut callback),
                         &mut interleaved,
                         silence,
                         asio_stream,
@@ -507,8 +482,7 @@ impl EventLoop {
                 (SampleFormat::F32, &sys::AsioSampleType::ASIOSTFloat32LSB) |
                 (SampleFormat::F32, &sys::AsioSampleType::ASIOSTFloat32MSB) => {
                     process_output_callback::<f32, f32, _, _>(
-                        stream_id,
-                        callback,
+                        Some(&mut callback),
                         &mut interleaved,
                         silence,
                         asio_stream,
@@ -523,8 +497,7 @@ impl EventLoop {
                 // conversion function.
                 (SampleFormat::I16, &sys::AsioSampleType::ASIOSTInt32LSB) => {
                     process_output_callback::<i16, i32, _, _>(
-                        stream_id,
-                        callback,
+                        Some(&mut callback),
                         &mut interleaved,
                         silence,
                         asio_stream,
@@ -535,8 +508,7 @@ impl EventLoop {
                 }
                 (SampleFormat::I16, &sys::AsioSampleType::ASIOSTInt32MSB) => {
                     process_output_callback::<i16, i32, _, _>(
-                        stream_id,
-                        callback,
+                        Some(&mut callback),
                         &mut interleaved,
                         silence,
                         asio_stream,
@@ -550,8 +522,7 @@ impl EventLoop {
                 (SampleFormat::F32, &sys::AsioSampleType::ASIOSTFloat64LSB) |
                 (SampleFormat::F32, &sys::AsioSampleType::ASIOSTFloat64MSB) => {
                     process_output_callback::<f32, f64, _, _>(
-                        stream_id,
-                        callback,
+                        Some(&mut callback),
                         &mut interleaved,
                         silence,
                         asio_stream,
@@ -568,75 +539,54 @@ impl EventLoop {
             }
         });
 
-        // Create the stream paused
-        self.cpal_streams
-            .lock()
-            .unwrap()
-            .push(Some(Stream { driver: driver.clone(), playing: false }));
-
         // Give the ID based on the stream count
-        Ok(StreamId(count))
+        Ok(stream_inner)
     }
+}
+
+impl StreamTrait for Stream {
 
     /// Play the cpal stream for the given ID.
-    pub fn play_stream(&self, stream_id: StreamId) -> Result<(), PlayStreamError> {
-        let mut streams = self.cpal_streams.lock().unwrap();
-        if let Some(s) = streams.get_mut(stream_id.0).expect("Bad play stream index") {
-            s.playing = true;
-            // Calling play when already playing is a no-op
-            s.driver.start().map_err(play_stream_err)?;
-        }
-        Ok(())
+    fn play(&self) -> Result<(), PlayStreamError> {
+        self.inner.playing = true;
+        self.inner.driver.start().map_err(play_stream_err)
     }
 
     /// Pause the cpal stream for the given ID.
     ///
     /// Pause the ASIO streams if there are no other CPAL streams playing, as ASIO only allows
     /// stopping the entire driver.
-    pub fn pause_stream(&self, stream_id: StreamId) -> Result<(), PauseStreamError> {
-        let mut streams = self.cpal_streams.lock().unwrap();
-        let streams_playing = streams.iter()
-            .filter(|s| s.as_ref().map(|s| s.playing).unwrap_or(false))
-            .count();
-        if let Some(s) = streams.get_mut(stream_id.0).expect("Bad pause stream index") {
-            if streams_playing <= 1 {
-                s.driver.stop().map_err(pause_stream_err)?;
-            }
-            s.playing = false;
-        }
+    fn pause(&self) -> Result<(), PauseStreamError> {
+        self.inner.driver.stop().map_err(pause_stream_err)?;
+        self.inner.playing = false;
         Ok(())
     }
 
-    /// Destroy the cpal stream based on the ID.
-    pub fn destroy_stream(&self, stream_id: StreamId) {
-        // TODO: Should we not also remove an ASIO stream here?
-        //       Yes, and we should update the logic in the callbacks to search for the stream with
-        //       the matching ID, rather than assuming the index associated with the ID is valid.
-        let mut streams = self.cpal_streams.lock().unwrap();
-        streams.get_mut(stream_id.0).take();
-    }
-
-    /// Run the cpal callbacks
-    pub fn run<F>(&self, mut callback: F) -> !
-    where
-        F: FnMut(StreamId, StreamDataResult) + Send,
-    {
-        let callback: &mut (FnMut(StreamId, StreamDataResult) + Send) = &mut callback;
-        // Transmute needed to convince the compiler that the callback has a static lifetime
-        *self.callbacks.lock().unwrap() = Some(unsafe { mem::transmute(callback) });
-        loop {
-            // A sleep here to prevent the loop being
-            // removed in --release
-            thread::sleep(Duration::new(1u64, 0u32));
-        }
-    }
 }
+
+// impl Stream {
+
+//     /// Run the cpal callbacks
+//     pub fn run<F>(&self, mut callback: F) -> !
+//     where
+//         F: FnMut(StreamId, StreamData) + Send,
+//     {
+//         let callback: &mut (dyn FnMut(StreamData) + Send) = &mut callback;
+//         // Transmute needed to convince the compiler that the callback has a static lifetime
+//         *self.callbacks.lock().unwrap() = Some(unsafe { mem::transmute(callback) });
+//         loop {
+//             // A sleep here to prevent the loop being
+//             // removed in --release
+//             thread::sleep(Duration::new(1u64, 0u32));
+//         }
+//     }
+// }
 
 /// Clean up if event loop is dropped.
 /// Currently event loop is never dropped.
-impl Drop for EventLoop {
+impl Drop for Stream {
     fn drop(&mut self) {
-        *self.asio_streams.lock().unwrap() = sys::AsioStreams {
+        *self.inner.asio_streams.lock().unwrap() = sys::AsioStreams {
             output: None,
             input: None,
         };
@@ -725,7 +675,7 @@ fn check_format(
 /// Cast a byte slice into a mutable slice of desired type.
 ///
 /// Safety: it's up to the caller to ensure that the input slice has valid bit representations.
-unsafe fn cast_slice_mut<T>(v: &mut [u8]) -> &mut [T] {
+pub unsafe fn cast_slice_mut<T>(v: &mut [u8]) -> &mut [T] {
     debug_assert!(v.len() % std::mem::size_of::<T>() == 0);
     std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut T, v.len() / std::mem::size_of::<T>())
 }
@@ -754,7 +704,7 @@ fn from_be<T: PrimInt>(t: T) -> T {
 ///
 /// Safety: it's up to the user to ensure that this function is not called multiple times for the
 /// same channel.
-unsafe fn asio_channel_slice<T>(
+pub unsafe fn asio_channel_slice<T>(
     asio_stream: &sys::AsioStream,
     buffer_index: usize,
     channel_index: usize,
@@ -778,7 +728,7 @@ unsafe fn asio_channel_slice_mut<T>(
     std::slice::from_raw_parts_mut(buff_ptr, asio_stream.buffer_size as usize)
 }
 
-fn build_stream_err(e: sys::AsioError) -> BuildStreamError {
+pub fn build_stream_err(e: sys::AsioError) -> BuildStreamError {
     match e {
         sys::AsioError::NoDrivers |
         sys::AsioError::HardwareMalfunction => BuildStreamError::DeviceNotAvailable,
